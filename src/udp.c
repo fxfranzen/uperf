@@ -159,6 +159,8 @@ protocol_udp_read(protocol_t *p, void *buffer, int n, void *options)
 	int nleft;
 	int total = 0;
 	int timeout = 0;
+	int partial = 0;
+	int poll;
 	ssize_t msgs_received;
 	uint64_t i, j;
 	uint64_t repeat = 1;
@@ -260,18 +262,7 @@ protocol_udp_read(protocol_t *p, void *buffer, int n, void *options)
 				(socklen_t)sizeof(from);
 		}
 
-		for (i = 0; i < repeat; i++) {
-			if (timeout > 0) {
-				if (generic_poll(pd->sock, timeout, POLLIN) <= 0) {
-					free(recvbuf);
-					if (mmsgs != stack_mmsgs) {
-						free(mmsgs);
-						free(iovs);
-					}
-					return (-1);
-				}
-			}
-
+		for (i = 0; i < repeat && !partial; i++) {
 			for (j = 0; j < batch_size; j++)
 				mmsgs[j].msg_hdr.msg_namelen =
 					(socklen_t)sizeof(from);
@@ -280,15 +271,37 @@ protocol_udp_read(protocol_t *p, void *buffer, int n, void *options)
 			offset = 0;
 
 			while (remaining > 0) {
+				if (timeout > 0) {
+					if (poll = generic_poll(pd->sock, timeout, POLLIN) <= 0) {
+						if (poll == 0) {
+							errno = ETIMEDOUT;
+						}
+
+						free(recvbuf);
+						if (mmsgs != stack_mmsgs) {
+							free(mmsgs);
+							free(iovs);
+						}
+						return (-1);
+					}
+				}
+
 				for (j = offset; j < batch_size; j++)
 					mmsgs[j].msg_hdr.msg_namelen = sizeof(from);
 
-				msgs_received = recvmmsg(pd->sock, mmsgs + offset * sizeof(struct mmsghdr), batch_size,
-				0, NULL);
+				msgs_received = recvmmsg(pd->sock, mmsgs + offset, remaining, 0, NULL);
 
 				if (msgs_received < 0) {
 					if (errno == EINTR)
 						continue;
+					if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
+					    timeout > 0)
+						continue;
+					if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
+					    (offset > 0 || total > 0)) {
+						partial = 1;
+						break;
+					}
 
 					free(recvbuf);
 
@@ -302,12 +315,12 @@ protocol_udp_read(protocol_t *p, void *buffer, int n, void *options)
 					return (-1);
 				}
 
+				for (j = 0; j < msgs_received; j++)
+					total += mmsgs[offset + j].msg_len;
+
 				offset += msgs_received;
 				remaining -= msgs_received;
 			}
-
-			for (j = 0; j < msgs_received; j++)
-				total += mmsgs[j].msg_len;
 		}
 
 		free(recvbuf);
